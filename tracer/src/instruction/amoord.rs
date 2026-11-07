@@ -1,0 +1,43 @@
+use crate::instruction::registers::amo::RegisterStateAMO;
+use serde::{Deserialize, Serialize};
+
+use crate::{declare_riscv_instr, emulator::cpu::Cpu};
+
+use super::{
+    format::format_amo::FormatAMO, Cycle, Instruction, RISCVInstruction, RISCVTrace, RamWrite,
+};
+
+declare_riscv_instr!(
+    name   = AMOORD,
+    mask   = 0xf800707f,
+    match  = 0x4000302f,
+    format = FormatAMO,
+    registers = RegisterStateAMO,
+    ram    = RamWrite
+);
+
+impl AMOORD {
+    fn exec(&self, cpu: &mut Cpu, _: &mut <AMOORD as RISCVInstruction>::RamAccess) {
+        let address = cpu.x[self.operands.rs1 as usize] as u64;
+        let or_value = cpu.x[self.operands.rs2 as usize] as u64;
+
+        let load_result = cpu.mmu.load_doubleword(address);
+        let original_value = match load_result {
+            Ok((doubleword, _)) => doubleword as i64,
+            Err(_) => panic!("MMU load error"),
+        };
+
+        let new_value = (original_value as u64) | or_value;
+        cpu.mmu
+            .store_doubleword(address, new_value)
+            .expect("MMU store error");
+
+        cpu.write_register(self.operands.rd as usize, original_value);
+    }
+}
+
+impl RISCVTrace for AMOORD {
+    fn trace(&self, cpu: &mut Cpu, trace: Option<&mut Vec<Cycle>>) {
+        super::trace_inline_sequence(&Instruction::from(*self), cpu, trace);
+    }
+}

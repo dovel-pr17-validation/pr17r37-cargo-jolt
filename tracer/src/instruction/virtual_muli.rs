@@ -1,0 +1,30 @@
+use crate::instruction::registers::i::RegisterStateI;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    declare_riscv_instr,
+    emulator::cpu::Cpu,
+    instruction::{format::format_i::FormatI, RISCVInstruction, RISCVTrace},
+};
+
+declare_riscv_instr!(
+    name = VirtualMULI,
+    mask = 0,
+    match = 0,
+    format = FormatI,
+    registers = RegisterStateI,
+    ram = ()
+);
+
+impl VirtualMULI {
+    fn exec(&self, cpu: &mut Cpu, _: &mut <VirtualMULI as RISCVInstruction>::RamAccess) {
+        cpu.write_register(
+            self.operands.rd as usize,
+            cpu.sign_extend(
+                cpu.x[self.operands.rs1 as usize].wrapping_mul(self.operands.imm as i64),
+            ),
+        );
+    }
+}
+
+impl RISCVTrace for VirtualMULI {}

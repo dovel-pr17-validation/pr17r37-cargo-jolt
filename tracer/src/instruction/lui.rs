@@ -1,0 +1,26 @@
+use crate::instruction::registers::u::RegisterStateU;
+use serde::{Deserialize, Serialize};
+
+use crate::{declare_riscv_instr, emulator::cpu::Cpu};
+
+use super::{
+    format::{format_u::FormatU, normalize_imm},
+    RISCVInstruction, RISCVTrace,
+};
+
+declare_riscv_instr!(
+    name   = LUI,
+    mask   = 0x0000007f,
+    match  = 0x00000037,
+    format = FormatU,
+    registers = RegisterStateU,
+    ram    = ()
+);
+
+impl LUI {
+    fn exec(&self, cpu: &mut Cpu, _: &mut <LUI as RISCVInstruction>::RamAccess) {
+        cpu.write_register(self.operands.rd as usize, normalize_imm(self.operands.imm));
+    }
+}
+
+impl RISCVTrace for LUI {}

@@ -1,0 +1,37 @@
+use std::time::Instant;
+use tracing::info;
+
+pub fn main() {
+    tracing_subscriber::fmt::init();
+
+    let target_dir = "/tmp/jolt-guest-targets";
+
+    let a = 3u64;
+    let m = 11u64;
+
+    info!("Computing modular inverse of {} modulo {}", a, m);
+
+    let mut program = guest::compile_modinv(target_dir);
+    let shared_preprocessing = guest::preprocess_shared_modinv(&mut program).unwrap();
+    let prover_preprocessing = guest::preprocess_prover_modinv(shared_preprocessing.clone());
+    let verifier_preprocessing =
+        guest::verifier_preprocessing_from_prover_modinv(&prover_preprocessing);
+    let prove_modinv = guest::build_prover_modinv(program, prover_preprocessing);
+    let verify_modinv = guest::build_verifier_modinv(verifier_preprocessing);
+
+    let now = Instant::now();
+    let (output_advice, proof_advice, io_device_advice) = prove_modinv(a, m);
+    let prove_time_advice = now.elapsed();
+    info!("Prover runtime: {} s", prove_time_advice.as_secs_f64());
+
+    let trace_length_advice = proof_advice.trace_length;
+
+    verify_modinv(a, m, output_advice, io_device_advice.panic, proof_advice)
+        .expect("Proof verification failed");
+
+    info!("Output (modular inverse): {}", output_advice);
+    info!("Trace length: {} cycles", trace_length_advice);
+
+    assert_eq!(output_advice, 4, "Expected inverse of 3 mod 11 to be 4");
+    assert_eq!(((a as u128) * (output_advice as u128)) % (m as u128), 1);
+}

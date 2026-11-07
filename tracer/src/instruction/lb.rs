@@ -1,0 +1,41 @@
+use crate::instruction::registers::load::RegisterStateLoad;
+use serde::{Deserialize, Serialize};
+
+use crate::{declare_riscv_instr, emulator::cpu::Cpu};
+
+use super::{Instruction, RamRead};
+
+use super::{format::format_load::FormatLoad, Cycle, RISCVInstruction, RISCVTrace};
+
+declare_riscv_instr!(
+    name   = LB,
+    mask   = 0x0000707f,
+    match  = 0x00000003,
+    format = FormatLoad,
+    registers = RegisterStateLoad,
+    ram    = RamRead
+);
+
+impl LB {
+    fn exec(&self, cpu: &mut Cpu, ram_access: &mut <LB as RISCVInstruction>::RamAccess) {
+        let value = match cpu
+            .mmu
+            .load(cpu.x[self.operands.rs1 as usize].wrapping_add(self.operands.imm) as u64)
+        {
+            Ok((byte, memory_read)) => {
+                *ram_access = memory_read;
+                byte as i8 as i64
+            }
+            Err(_) => panic!("MMU load error"),
+        };
+        cpu.write_register(self.operands.rd as usize, value);
+    }
+}
+
+impl RISCVTrace for LB {
+    fn trace(&self, cpu: &mut Cpu, trace: Option<&mut Vec<Cycle>>) {
+        super::trace_inline_sequence(&Instruction::from(*self), cpu, trace);
+    }
+}
+
+impl LB {}

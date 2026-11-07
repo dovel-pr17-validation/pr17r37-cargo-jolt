@@ -1,0 +1,540 @@
+#![cfg(test)]
+#![allow(non_upper_case_globals)]
+
+use crate::{Z3_RANDOM_SEED, Z3_TIMEOUT_MS};
+use jolt_claims::protocols::composed::r1cs::rv64::{
+    self, NUM_R1CS_INPUTS, NUM_VARS_PER_CYCLE, V_BRANCH, V_CONST, V_NEXT_IS_NOOP,
+};
+use jolt_field::{Fr, Ring};
+use jolt_r1cs::SparseRow;
+use jolt_riscv::{
+    CircuitFlags, Flags, InstructionFlags, JoltInstruction, CIRCUIT_FLAGS, NUM_CIRCUIT_FLAGS,
+    NUM_INSTRUCTION_FLAGS,
+};
+use std::{array, fmt::Write, str::FromStr};
+use tracer::instruction::{
+    add::ADD,
+    addi::ADDI,
+    and::AND,
+    andi::ANDI,
+    andn::ANDN,
+    auipc::AUIPC,
+    beq::BEQ,
+    bge::BGE,
+    bgeu::BGEU,
+    blt::BLT,
+    bltu::BLTU,
+    bne::BNE,
+    fence::FENCE,
+    format::{
+        format_b::FormatB, format_i::FormatI, format_j::FormatJ, format_load::FormatLoad,
+        format_no_operands::FormatNoOperands, format_r::FormatR, format_s::FormatS,
+        format_t::FormatT, format_u::FormatU,
+        format_virtual_right_shift_i::FormatVirtualRightShiftI,
+        format_virtual_right_shift_r::FormatVirtualRightShiftR,
+    },
+    jal::JAL,
+    jalr::JALR,
+    ld::LD,
+    lui::LUI,
+    mul::MUL,
+    mulhu::MULHU,
+    or::OR,
+    ori::ORI,
+    sd::SD,
+    slt::SLT,
+    slti::SLTI,
+    sltiu::SLTIU,
+    sltu::SLTU,
+    sub::SUB,
+    virtual_advice::VirtualAdvice,
+    virtual_assert_eq::VirtualAssertEQ,
+    virtual_assert_lte::VirtualAssertLTE,
+    virtual_assert_mulu_no_overflow::VirtualAssertMulUNoOverflow,
+    virtual_assert_valid_div0::VirtualAssertValidDiv0,
+    virtual_assert_valid_unsigned_remainder::VirtualAssertValidUnsignedRemainder,
+    virtual_load_b::VirtualLoadB,
+    virtual_load_h::VirtualLoadH,
+    virtual_load_w::VirtualLoadW,
+    virtual_movsign::VirtualMovsign,
+    virtual_muli::VirtualMULI,
+    virtual_muliw::VirtualMULIW,
+    virtual_negate_if::VirtualNegateIf,
+    virtual_pow2::VirtualPow2,
+    virtual_pow2_w::VirtualPow2W,
+    virtual_pow2i::VirtualPow2I,
+    virtual_pow2i_w::VirtualPow2IW,
+    virtual_rev8w::VirtualRev8W,
+    virtual_rotriw::VirtualROTRIW,
+    virtual_shift_right_bitmask::VirtualShiftRightBitmask,
+    virtual_shift_right_bitmaski::VirtualShiftRightBitmaskI,
+    virtual_sign_extend_word::VirtualSignExtendWord,
+    virtual_sra::VirtualSRA,
+    virtual_srai::VirtualSRAI,
+    virtual_srl::VirtualSRL,
+    virtual_srli::VirtualSRLI,
+    virtual_store_b::VirtualStoreB,
+    virtual_store_h::VirtualStoreH,
+    virtual_store_w::VirtualStoreW,
+    Instruction,
+};
+use z3::{ast::Int, Params, SatResult, Solver};
+
+#[derive(Clone, Debug)]
+struct JoltState<T = Int> {
+    left_input: T,
+    right_input: T,
+    product: T,
+    left_lookup: T,
+    right_lookup: T,
+    lookup_output: T,
+    rs1_value: T,
+    rs2_value: T,
+    rd_write_value: T,
+    ram_addr: T,
+    ram_read_value: T,
+    ram_write_value: T,
+    pc: T,
+    next_pc: T,
+    unexpanded_pc: T,
+    next_unexpanded_pc: T,
+    imm: T,
+    flags: [T; NUM_CIRCUIT_FLAGS],
+    instruction_flags: [T; NUM_INSTRUCTION_FLAGS],
+    next_is_noop: T,
+    should_jump: T,
+    should_branch: T,
+    next_is_virtual: T,
+    next_is_first_in_sequence: T,
+    virtual_sequence_active: T,
+}
+
+fn signed_coefficient(value: &Fr) -> Int {
+    const COEFFICIENTS: [i128; 7] = [-(1i128 << 64), -4, -2, -1, 1, 2, 4];
+    let coefficient = COEFFICIENTS
+        .into_iter()
+        .find(|candidate| *value == Fr::from_i128(*candidate))
+        .unwrap_or_else(|| panic!("unsupported RV64 R1CS coefficient: {value:?}"));
+    Int::from_str(&coefficient.to_string()).unwrap()
+}
+
+impl JoltState {
+    fn new(prefix: String) -> Self {
+        JoltState {
+            left_input: Int::new_const(format!("{prefix}_left_input")),
+            right_input: Int::new_const(format!("{prefix}_right_input")),
+            product: Int::new_const(format!("{prefix}_product")),
+            left_lookup: Int::new_const(format!("{prefix}_left_lookup")),
+            right_lookup: Int::new_const(format!("{prefix}_right_lookup")),
+            lookup_output: Int::new_const(format!("{prefix}_lookup_output")),
+            rs1_value: Int::new_const(format!("{prefix}_rs1_read_value")),
+            rs2_value: Int::new_const(format!("{prefix}_rs2_read_value")),
+            rd_write_value: Int::new_const(format!("{prefix}_rd_write_value")),
+            ram_addr: Int::new_const(format!("{prefix}_ram_addr")),
+            ram_read_value: Int::new_const(format!("{prefix}_ram_read_value")),
+            ram_write_value: Int::new_const(format!("{prefix}_ram_write_value")),
+            pc: Int::new_const(format!("{prefix}_pc")),
+            next_pc: Int::new_const(format!("{prefix}_next_pc")),
+            unexpanded_pc: Int::new_const(format!("{prefix}_unexpanded_pc")),
+            next_unexpanded_pc: Int::new_const(format!("{prefix}_next_unexpanded_pc")),
+            imm: Int::new_const(format!("{prefix}_imm")),
+            flags: array::from_fn(|i| Int::new_const(format!("{prefix}_flag_{i}"))),
+            instruction_flags: array::from_fn(|i| {
+                Int::new_const(format!("{prefix}_instr_flag_{i}"))
+            }),
+            next_is_noop: Int::new_const(format!("{prefix}_next_is_noop")),
+            should_jump: Int::new_const(format!("{prefix}_should_jump")),
+            should_branch: Int::new_const(format!("{prefix}_should_branch")),
+            next_is_virtual: Int::new_const(format!("{prefix}_next_is_virtual")),
+            next_is_first_in_sequence: Int::new_const(format!(
+                "{prefix}_next_is_first_in_sequence"
+            )),
+            virtual_sequence_active: Int::new_const(format!("{prefix}_virtual_sequence_active")),
+        }
+    }
+
+    fn r1cs_inputs(&self) -> [&Int; NUM_R1CS_INPUTS] {
+        let scalars = [
+            &self.left_input,
+            &self.right_input,
+            &self.product,
+            &self.should_branch,
+            &self.pc,
+            &self.unexpanded_pc,
+            &self.imm,
+            &self.ram_addr,
+            &self.rs1_value,
+            &self.rs2_value,
+            &self.rd_write_value,
+            &self.ram_read_value,
+            &self.ram_write_value,
+            &self.left_lookup,
+            &self.right_lookup,
+            &self.next_unexpanded_pc,
+            &self.next_pc,
+            &self.next_is_virtual,
+            &self.next_is_first_in_sequence,
+            &self.lookup_output,
+            &self.should_jump,
+        ];
+        array::from_fn(|index| {
+            if index < scalars.len() {
+                scalars[index]
+            } else {
+                &self.flags[index - scalars.len()]
+            }
+        })
+    }
+
+    fn r1cs_vars(&self) -> [Int; NUM_VARS_PER_CYCLE] {
+        let inputs = self.r1cs_inputs();
+        array::from_fn(|index| match index {
+            V_CONST => Int::from(1),
+            V_BRANCH => self.instruction_flags[InstructionFlags::Branch as usize].clone(),
+            V_NEXT_IS_NOOP => self.next_is_noop.clone(),
+            _ => inputs[index - 1].clone(),
+        })
+    }
+
+    fn sparse_row_to_int(row: &SparseRow<Fr>, vars: &[Int; NUM_VARS_PER_CYCLE]) -> Int {
+        row.iter().fold(Int::from(0), |sum, (index, coefficient)| {
+            sum + signed_coefficient(coefficient) * &vars[*index]
+        })
+    }
+
+    fn add_r1cs_constraints(&self, solver: &mut Solver) {
+        let matrices = rv64::rv64_trace_constraints::<Fr>();
+        let vars = self.r1cs_vars();
+        for ((a, b), c) in matrices.a.iter().zip(&matrices.b).zip(&matrices.c) {
+            let a = Self::sparse_row_to_int(a, &vars);
+            let b = Self::sparse_row_to_int(b, &vars);
+            let c = Self::sparse_row_to_int(c, &vars);
+            *solver += (a * b).eq(c);
+        }
+    }
+
+    /// Hand copy of jolt-claims' `InputVirtualization` relation; keep it in sync.
+    fn add_input_constraints(&self, solver: &mut Solver) {
+        *solver += (&self.instruction_flags[InstructionFlags::LeftOperandIsRs1Value as usize]
+            * &self.rs1_value
+            + &self.instruction_flags[InstructionFlags::LeftOperandIsPC as usize] * &self.pc)
+            .eq(&self.left_input);
+
+        *solver += (&self.instruction_flags[InstructionFlags::RightOperandIsRs2Value as usize]
+            * &self.rs2_value
+            + &self.instruction_flags[InstructionFlags::RightOperandIsImm as usize] * &self.imm
+            + &self.instruction_flags[InstructionFlags::RightOperandIsRdWriteValue as usize]
+                * &self.rd_write_value)
+            .eq(&self.right_input);
+    }
+
+    fn add_constraints(&self, solver: &mut Solver) {
+        self.add_r1cs_constraints(solver);
+        self.add_input_constraints(solver);
+    }
+
+    fn assert_output_differs(&self, solver: &mut Solver, other: &Self) {
+        let mut or_terms = vec![
+            // we are currently missing constraints on next_pc
+            //(&self.next_pc).ne(&other.next_pc),
+            self.next_is_noop.eq(Int::from(0))
+                & self.next_unexpanded_pc.ne(&other.next_unexpanded_pc),
+            self.left_lookup.ne(&other.left_lookup),
+            self.right_lookup.ne(&other.right_lookup),
+            self.ram_addr.ne(&other.ram_addr),
+            (&self.ram_addr.ne(Int::from(0))) & self.ram_write_value.ne(&other.ram_write_value),
+        ];
+        or_terms.push(
+            self.flags[CircuitFlags::WriteLookupOutputToRD as usize].eq(Int::from(1))
+                & self.rd_write_value.ne(&other.rd_write_value),
+        );
+
+        *solver += or_terms.into_iter().reduce(|acc, t| acc | t).unwrap();
+    }
+
+    fn assert_input_matches(&self, solver: &mut Solver, instr: &Instruction, other: &Self) {
+        let row = instr
+            .try_jolt_instruction_row()
+            .expect("Z3 instruction constraints require a final Jolt row");
+        let instruction = JoltInstruction::from(row);
+        let flags = instruction.circuit_flags();
+        let instruction_flags = instruction.instruction_flags();
+
+        self.flags
+            .iter()
+            .zip(other.flags.iter())
+            .zip(CIRCUIT_FLAGS)
+            .for_each(|((self_flag, other_flag), flag)| {
+                let flag_value = flags.get(flag);
+                let flag_value = Int::from(flag_value as i64);
+                *solver += self_flag.eq(&flag_value);
+                *solver += other_flag.eq(&flag_value);
+            });
+
+        const INSTRUCTION_FLAGS: [InstructionFlags; NUM_INSTRUCTION_FLAGS] = [
+            InstructionFlags::LeftOperandIsPC,
+            InstructionFlags::RightOperandIsImm,
+            InstructionFlags::LeftOperandIsRs1Value,
+            InstructionFlags::RightOperandIsRs2Value,
+            InstructionFlags::Branch,
+            InstructionFlags::IsNoop,
+            InstructionFlags::RightOperandIsRdWriteValue,
+        ];
+        self.instruction_flags
+            .iter()
+            .zip(other.instruction_flags.iter())
+            .zip(INSTRUCTION_FLAGS)
+            .for_each(|((self_flag, other_flag), flag)| {
+                let flag_value = instruction_flags.get(flag);
+                let flag_value = Int::from(flag_value as i64);
+                *solver += self_flag.eq(&flag_value);
+                *solver += other_flag.eq(&flag_value);
+            });
+
+        *solver += self.imm.eq(&other.imm);
+
+        // Only operands are matched: the instruction inputs follow from them through
+        // `add_input_constraints`, and matching those too would assume a direct load's
+        // result, which is its right input.
+        *solver += self.rs1_value.eq(&other.rs1_value);
+        *solver += self.rs2_value.eq(&other.rs2_value);
+
+        *solver += self.pc.eq(&other.pc);
+        *solver += self.unexpanded_pc.eq(&other.unexpanded_pc);
+        *solver += self.next_is_noop.eq(&other.next_is_noop);
+
+        // Direct loads look up no table (pinned by jolt-lookup-tables' registry test), so
+        // instruction read-RAF forces their LookupOutput to 0. The addition stand-in would
+        // move R1CS constraint 0's RamAddress by the loaded word.
+        if instruction_flags.get(InstructionFlags::RightOperandIsRdWriteValue) {
+            *solver += self.lookup_output.eq(Int::from(0));
+            *solver += other.lookup_output.eq(Int::from(0));
+        } else {
+            // for now we don't emulate the other lookup tables, just use addition arbitrarily
+            *solver += self
+                .lookup_output
+                .eq(&self.left_lookup + &self.right_lookup);
+            *solver += other
+                .lookup_output
+                .eq(&other.left_lookup + &other.right_lookup);
+        }
+
+        if let Instruction::VirtualAdvice(instruction) = instr {
+            let zero = Int::from(0);
+            let advice = Int::from_str(&instruction.advice.to_string()).unwrap();
+            *solver += self.left_lookup.eq(&zero);
+            *solver += other.left_lookup.eq(&zero);
+            *solver += self.right_lookup.eq(&advice);
+            *solver += other.right_lookup.eq(&advice);
+            *solver += self.lookup_output.eq(&advice);
+            *solver += other.lookup_output.eq(&advice);
+        }
+
+        let rv1 = Int::new_const("rv1");
+        let rv2 = Int::new_const("rv2");
+        let ram_expr = |addr: &Int| {
+            addr.eq(Int::from(8))
+                .ite(&rv1, &addr.eq(Int::from(16)).ite(&rv2, &Int::from(0)))
+        };
+        *solver += self.ram_read_value.eq(ram_expr(&self.ram_addr));
+        *solver += other.ram_read_value.eq(ram_expr(&other.ram_addr));
+    }
+
+    fn eval(self, model: &z3::Model) -> Option<JoltState<i64>> {
+        let eval = |x: &Int| model.eval(x, true).and_then(|v| v.as_i64());
+        let flags = self.flags.map(|f| eval(&f).unwrap());
+        let instruction_flags = self.instruction_flags.map(|f| eval(&f).unwrap());
+
+        Some(JoltState {
+            left_input: eval(&self.left_input)?,
+            right_input: eval(&self.right_input)?,
+            product: eval(&self.product)?,
+            left_lookup: eval(&self.left_lookup)?,
+            right_lookup: eval(&self.right_lookup)?,
+            lookup_output: eval(&self.lookup_output)?,
+            rs1_value: eval(&self.rs1_value)?,
+            rs2_value: eval(&self.rs2_value)?,
+            rd_write_value: eval(&self.rd_write_value)?,
+            ram_addr: eval(&self.ram_addr)?,
+            ram_read_value: eval(&self.ram_read_value)?,
+            ram_write_value: eval(&self.ram_write_value)?,
+            pc: eval(&self.pc)?,
+            next_pc: eval(&self.next_pc)?,
+            unexpanded_pc: eval(&self.unexpanded_pc)?,
+            next_unexpanded_pc: eval(&self.next_unexpanded_pc)?,
+            imm: eval(&self.imm)?,
+            flags,
+            instruction_flags,
+            next_is_noop: eval(&self.next_is_noop)?,
+            should_jump: eval(&self.should_jump)?,
+            should_branch: eval(&self.should_branch)?,
+            next_is_virtual: eval(&self.next_is_virtual)?,
+            next_is_first_in_sequence: eval(&self.next_is_first_in_sequence)?,
+            virtual_sequence_active: eval(&self.virtual_sequence_active)?,
+        })
+    }
+}
+
+struct CompareResult {
+    field: &'static str,
+    lhs: i64,
+    rhs: i64,
+}
+
+impl JoltState<i64> {
+    fn compare(&self, other: &Self) -> (Vec<CompareResult>, Vec<CompareResult>) {
+        macro_rules! cmp {
+            ($vec:ident, $field:ident) => {
+                if self.$field != other.$field {
+                    $vec.push(CompareResult {
+                        field: stringify!($field),
+                        lhs: self.$field,
+                        rhs: other.$field,
+                    });
+                }
+            };
+        }
+        let mut input = vec![];
+        let mut output = vec![];
+        cmp!(input, rs1_value);
+        cmp!(input, rs2_value);
+        cmp!(input, left_input);
+        cmp!(input, right_input);
+        cmp!(input, imm);
+        cmp!(input, ram_addr);
+        cmp!(input, ram_read_value);
+        cmp!(input, next_is_noop);
+
+        cmp!(output, ram_write_value);
+        cmp!(output, rd_write_value);
+        cmp!(output, next_pc);
+        cmp!(output, next_unexpanded_pc);
+        (input, output)
+    }
+}
+
+fn do_test(name: &str, instr: &Instruction) {
+    let mut solver_params = Params::default();
+    solver_params.set_u32("timeout", Z3_TIMEOUT_MS);
+    solver_params.set_u32("random_seed", Z3_RANDOM_SEED);
+
+    let mut solver = Solver::new();
+    solver.set_params(&solver_params);
+
+    let r1 = JoltState::new("r1".to_string());
+    r1.add_constraints(&mut solver);
+
+    let r2 = JoltState::new("r2".to_string());
+    r2.add_constraints(&mut solver);
+
+    r1.assert_input_matches(&mut solver, instr, &r2);
+
+    assert!(matches!(solver.check(), SatResult::Sat));
+
+    r1.assert_output_differs(&mut solver, &r2);
+    match solver.check() {
+        SatResult::Sat => {
+            let mut msg = format!("Found differing outputs for {name}\n");
+            let model = solver.get_model().unwrap();
+            let r1 = r1.eval(&model).unwrap();
+            let r2 = r2.eval(&model).unwrap();
+            let (inputs, outputs) = r1.compare(&r2);
+            if !inputs.is_empty() {
+                let _ = writeln!(msg, "Inputs:");
+                for input in inputs {
+                    let _ = writeln!(msg, "    {}: {} != {}", input.field, input.lhs, input.rhs);
+                }
+            }
+            if !outputs.is_empty() {
+                let _ = writeln!(msg, "Outputs:");
+                for output in outputs {
+                    let _ = writeln!(
+                        msg,
+                        "    {}: {} != {}",
+                        output.field, output.lhs, output.rhs
+                    );
+                }
+            }
+            panic!("{}", msg.trim());
+        }
+        SatResult::Unsat => (),
+        SatResult::Unknown => panic!("Solver failed/timed out, result inconclusive"),
+    }
+}
+
+macro_rules! test_instruction_constraints {
+    ($instr:ident, $operands:path $(, $field:ident : $value:expr )* $(,)?) => {
+        paste::paste! {
+            #[test]
+            #[allow(nonstandard_style)]
+            fn [<test_ $instr>]() {
+                let instr = Instruction::$instr($instr {
+                    operands: $crate::template_format!($operands),
+                    $($field: $value,)*
+                    address: 8,
+                    is_compressed: false,
+                    is_first_in_sequence: false,
+                    virtual_sequence_remaining: None,
+                });
+                do_test(stringify!(instr), &instr);
+            }
+        }
+    };
+}
+
+test_instruction_constraints!(ADD, FormatR);
+test_instruction_constraints!(ADDI, FormatI);
+test_instruction_constraints!(AND, FormatR);
+test_instruction_constraints!(ANDI, FormatI);
+test_instruction_constraints!(ANDN, FormatR);
+test_instruction_constraints!(AUIPC, FormatU);
+test_instruction_constraints!(BEQ, FormatB);
+test_instruction_constraints!(BGE, FormatB);
+test_instruction_constraints!(BGEU, FormatB);
+test_instruction_constraints!(BLT, FormatB);
+test_instruction_constraints!(BLTU, FormatB);
+test_instruction_constraints!(BNE, FormatB);
+test_instruction_constraints!(FENCE, FormatNoOperands);
+test_instruction_constraints!(JAL, FormatJ);
+test_instruction_constraints!(JALR, FormatI);
+test_instruction_constraints!(LD, FormatLoad);
+test_instruction_constraints!(LUI, FormatU);
+test_instruction_constraints!(MUL, FormatR);
+test_instruction_constraints!(MULHU, FormatR);
+test_instruction_constraints!(OR, FormatR);
+test_instruction_constraints!(ORI, FormatI);
+test_instruction_constraints!(SD, FormatS);
+test_instruction_constraints!(SLT, FormatR);
+test_instruction_constraints!(SLTI, FormatI);
+test_instruction_constraints!(SLTIU, FormatI);
+test_instruction_constraints!(SLTU, FormatR);
+test_instruction_constraints!(SUB, FormatR);
+test_instruction_constraints!(VirtualAdvice, FormatJ, advice: 0);
+test_instruction_constraints!(VirtualAssertEQ, FormatB);
+test_instruction_constraints!(VirtualAssertLTE, FormatB);
+test_instruction_constraints!(VirtualAssertMulUNoOverflow, FormatB);
+test_instruction_constraints!(VirtualAssertValidDiv0, FormatB);
+test_instruction_constraints!(VirtualAssertValidUnsignedRemainder, FormatB);
+test_instruction_constraints!(VirtualLoadB, FormatLoad);
+test_instruction_constraints!(VirtualLoadH, FormatLoad);
+test_instruction_constraints!(VirtualLoadW, FormatLoad);
+test_instruction_constraints!(VirtualNegateIf, FormatR);
+test_instruction_constraints!(VirtualMovsign, FormatI);
+test_instruction_constraints!(VirtualMULI, FormatI);
+test_instruction_constraints!(VirtualMULIW, FormatI);
+test_instruction_constraints!(VirtualPow2, FormatI);
+test_instruction_constraints!(VirtualPow2I, FormatJ);
+test_instruction_constraints!(VirtualPow2IW, FormatJ);
+test_instruction_constraints!(VirtualPow2W, FormatI);
+test_instruction_constraints!(VirtualRev8W, FormatT);
+test_instruction_constraints!(VirtualROTRIW, FormatVirtualRightShiftI);
+test_instruction_constraints!(VirtualShiftRightBitmask, FormatI);
+test_instruction_constraints!(VirtualShiftRightBitmaskI, FormatJ);
+test_instruction_constraints!(VirtualSignExtendWord, FormatI);
+test_instruction_constraints!(VirtualSRA, FormatVirtualRightShiftR);
+test_instruction_constraints!(VirtualSRAI, FormatVirtualRightShiftI);
+test_instruction_constraints!(VirtualSRL, FormatVirtualRightShiftR);
+test_instruction_constraints!(VirtualSRLI, FormatVirtualRightShiftI);
+test_instruction_constraints!(VirtualStoreB, FormatS);
+test_instruction_constraints!(VirtualStoreH, FormatS);
+test_instruction_constraints!(VirtualStoreW, FormatS);

@@ -1,0 +1,1275 @@
+/// DRAM base address. Offset from this base address
+/// is the address in main memory.
+pub const DRAM_BASE: u64 = RAM_START_ADDRESS;
+
+use crate::emulator::decode_cache::DecodeCache;
+use crate::emulator::memory::Memory;
+use common::constants::{RAM_START_ADDRESS, STACK_CANARY_SIZE};
+use common::jolt_device::JoltDevice;
+use jolt_riscv::{RamRead, RamWrite};
+
+use super::cpu::{get_privilege_mode, PrivilegeMode, Trap, TrapType};
+use super::terminal::Terminal;
+
+#[derive(Clone, Debug)]
+pub struct Mmu {
+    ppn: u64,
+    addressing_mode: AddressingMode,
+    privilege_mode: PrivilegeMode,
+    pub memory: MemoryWrapper,
+
+    /// Pre-decoded instruction cache. Lives on the Mmu so the store paths can
+    /// invalidate it directly when the executable range is written.
+    pub decode_cache: DecodeCache,
+
+    pub jolt_device: Option<JoltDevice>,
+
+    /// Address translation can be affected `mstatus` (MPRV, MPP in machine mode)
+    /// then `Mmu` has copy of it.
+    mstatus: u64,
+}
+
+#[derive(Clone, Debug, Copy)]
+pub enum AddressingMode {
+    None,
+    SV39,
+    SV48,
+}
+
+enum MemoryAccessType {
+    Execute,
+    Read,
+    Write,
+}
+
+impl Mmu {
+    pub fn new(_terminal: Box<dyn Terminal>) -> Self {
+        Mmu {
+            ppn: 0,
+            addressing_mode: AddressingMode::None,
+            privilege_mode: PrivilegeMode::Machine,
+            memory: MemoryWrapper::new(),
+            decode_cache: DecodeCache::empty(),
+            jolt_device: None,
+            mstatus: 0,
+        }
+    }
+
+    /// Set the executable address range covered by the pre-decoded
+    /// instruction cache.
+    pub fn init_decode_cache(&mut self, text_base: u64, text_end: u64) {
+        self.decode_cache.init(text_base, text_end);
+    }
+
+    /// Initializes Main memory. This method is expected to be called only once.
+    ///
+    /// # Arguments
+    /// * `capacity`
+    pub fn init_memory(&mut self, capacity: u64) {
+        self.memory.init(capacity);
+    }
+
+    pub fn update_addressing_mode(&mut self, new_addressing_mode: AddressingMode) {
+        self.addressing_mode = new_addressing_mode;
+    }
+
+    pub fn update_privilege_mode(&mut self, mode: PrivilegeMode) {
+        self.privilege_mode = mode;
+    }
+
+    /// Updates mstatus copy. `CPU` needs to call this method whenever
+    /// `mstatus` is updated.
+    ///
+    /// # Arguments
+    /// * `mstatus`
+    pub fn update_mstatus(&mut self, mstatus: u64) {
+        self.mstatus = mstatus;
+    }
+
+    /// Updates PPN used for address translation
+    ///
+    /// # Arguments
+    /// * `ppn`
+    pub fn update_ppn(&mut self, ppn: u64) {
+        self.ppn = ppn;
+    }
+
+    fn get_effective_address(&self, address: u64) -> u64 {
+        address
+    }
+
+    #[inline]
+    fn assert_effective_store_address(&self, effective_address: u64) {
+        self.assert_effective_address(effective_address, true)
+    }
+
+    #[inline]
+    fn assert_effective_load_address(&self, effective_address: u64) {
+        self.assert_effective_address(effective_address, false)
+    }
+
+    #[inline]
+    fn assert_effective_address(&self, ea: u64, is_write: bool) {
+        if self.jolt_device.is_none() {
+            return;
+        }
+
+        let jolt_device = self.jolt_device.as_ref().unwrap();
+        let layout = &jolt_device.memory_layout;
+        let (action, verb) = if is_write {
+            ("Store", "write to")
+        } else {
+            ("Load", "read from")
+        };
+
+        if ea < DRAM_BASE {
+            assert!(
+                ea <= layout.io_end,
+                "I/O overflow: Attempted to {verb} 0x{ea:X}. Out of bounds.\n{layout:#?}",
+            );
+            assert!(
+                ea >= layout.get_lowest_address() || ea <= RAM_START_ADDRESS - 8,
+                "I/O underflow: Attempted to {verb} 0x{ea:X}. Out of bounds.\n{layout:#?}",
+            );
+
+            let ok = if is_write {
+                jolt_device.is_output(ea)
+                    || jolt_device.is_panic(ea)
+                    || jolt_device.is_termination(ea)
+            } else {
+                jolt_device.is_input(ea)
+                    || jolt_device.is_trusted_advice(ea)
+                    || jolt_device.is_untrusted_advice(ea)
+                    || jolt_device.is_output(ea)
+                    || jolt_device.is_panic(ea)
+                    || jolt_device.is_termination(ea)
+                    || ea <= RAM_START_ADDRESS - 8
+            };
+            assert!(
+                ok,
+                "Illegal device {}: Unknown memory mapping: 0x{ea:X}\n{layout:#?}",
+                action.to_lowercase(),
+            );
+        } else {
+            if is_write {
+                // These errors aren't necessarily correct as there's no way to distinguish between an
+                // attempt to write to the stack vs heap, but they're trying their best.
+                // The canary is the half-open range [stack_end, stack_end + STACK_CANARY_SIZE):
+                // the linker script places it directly after the program image
+                // (`__stack_bottom == stack_end`) and the stack proper starts right after it.
+                assert!(
+                    ea < layout.stack_end || ea >= layout.stack_end + STACK_CANARY_SIZE,
+                    "Stack overflow: attempted to {verb} 0x{ea:X}, which is in the stack canary region. \
+                    Increase stack_size in MemoryConfig (currently {} bytes).",
+                    layout.stack_size,
+                );
+                assert!(
+                    ea < layout.heap_end,
+                    "Heap overflow: attempted to {verb} 0x{ea:X}, which is beyond the heap. \
+                    Increase heap_size in MemoryConfig (currently {} bytes).",
+                    layout.heap_size,
+                );
+            } else {
+                assert!(
+                    ea < layout.heap_end,
+                    "Illegal Memory Access: Attempted to {verb} 0x{ea:X}.\n{layout:#?}",
+                );
+            }
+        }
+    }
+
+    fn fetch(&mut self, v_address: u64) -> Result<u8, Trap> {
+        match self.translate_address(v_address, &MemoryAccessType::Execute) {
+            Ok(p_address) => Ok(self.load_raw(p_address)),
+            Err(()) => Err(Trap {
+                trap_type: TrapType::InstructionPageFault,
+                value: v_address,
+            }),
+        }
+    }
+
+    /// Fetches instruction four bytes. This method takes virtual address
+    /// and translates into physical address inside.
+    ///
+    /// # Arguments
+    /// * `v_address` Virtual address
+    pub fn fetch_word(&mut self, v_address: u64) -> Result<u32, Trap> {
+        let width = 4;
+        match (v_address & 0xfff) <= (0x1000 - width) {
+            true => {
+                // Fast path. All bytes fetched are in the same page so
+                // translating an address only once.
+                let effective_address = self.get_effective_address(v_address);
+                match self.translate_address(effective_address, &MemoryAccessType::Execute) {
+                    Ok(p_address) => Ok(self.load_word_raw(p_address)),
+                    Err(()) => Err(Trap {
+                        trap_type: TrapType::InstructionPageFault,
+                        value: effective_address,
+                    }),
+                }
+            }
+            false => {
+                let mut data = 0_u32;
+                for i in 0..width {
+                    match self.fetch(v_address.wrapping_add(i)) {
+                        Ok(byte) => data |= (byte as u32) << (i * 8),
+                        Err(e) => return Err(e),
+                    };
+                }
+                Ok(data)
+            }
+        }
+    }
+
+    /// Loads a byte. This method takes virtual address and translates
+    /// into physical address inside.
+    ///
+    /// # Arguments
+    /// * `v_address` Virtual address
+    pub fn load(&mut self, v_address: u64) -> Result<(u8, RamRead), Trap> {
+        let effective_address = self.get_effective_address(v_address);
+        let memory_read = self.trace_load(effective_address);
+        match self.translate_address(effective_address, &MemoryAccessType::Read) {
+            Ok(p_address) => Ok((self.load_raw(p_address), memory_read)),
+            Err(()) => Err(Trap {
+                trap_type: TrapType::LoadPageFault,
+                value: v_address,
+            }),
+        }
+    }
+
+    /// Loads multiple bytes. This method takes virtual address and translates
+    /// into physical address inside.
+    ///
+    /// # Arguments
+    /// * `v_address` Virtual address
+    /// * `width` Must be 1, 2, 4, or 8
+    fn load_bytes(&mut self, v_address: u64, width: u64) -> Result<u64, Trap> {
+        debug_assert!(
+            width == 1 || width == 2 || width == 4 || width == 8,
+            "Width must be 1, 2, 4, or 8. {width:X}"
+        );
+        match (v_address & 0xfff) <= (0x1000 - width) {
+            true => match self.translate_address(v_address, &MemoryAccessType::Read) {
+                Ok(p_address) => {
+                    // Fast path. All bytes fetched are in the same page so
+                    // translating an address only once.
+                    match width {
+                        1 => Ok(self.load_raw(p_address) as u64),
+                        2 => Ok(self.load_halfword_raw(p_address) as u64),
+                        4 => Ok(self.load_word_raw(p_address) as u64),
+                        8 => Ok(self.load_doubleword_raw(p_address)),
+                        _ => panic!("Width must be 1, 2, 4, or 8. {width:X}"),
+                    }
+                }
+                Err(()) => Err(Trap {
+                    trap_type: TrapType::LoadPageFault,
+                    value: v_address,
+                }),
+            },
+            false => {
+                let mut data = 0_u64;
+                for i in 0..width {
+                    match self.load(v_address.wrapping_add(i)) {
+                        Ok((byte, _)) => data |= (byte as u64) << (i * 8),
+                        Err(e) => return Err(e),
+                    };
+                }
+                Ok(data)
+            }
+        }
+    }
+
+    /// Loads two bytes. This method takes virtual address and translates
+    /// into physical address inside.
+    ///
+    /// # Arguments
+    /// * `v_address` Virtual address
+    pub fn load_halfword(&mut self, v_address: u64) -> Result<(u16, RamRead), Trap> {
+        let effective_address = self.get_effective_address(v_address);
+        assert!(
+            effective_address.is_multiple_of(2),
+            "Unaligned load_halfword"
+        );
+        let memory_read = self.trace_load(effective_address);
+        match self.load_bytes(v_address, 2) {
+            Ok(data) => Ok((data as u16, memory_read)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Loads four bytes. This method takes virtual address and translates
+    /// into physical address inside.
+    ///
+    /// # Arguments
+    /// * `v_address` Virtual address
+    pub fn load_word(&mut self, v_address: u64) -> Result<(u32, RamRead), Trap> {
+        let effective_address = self.get_effective_address(v_address);
+        assert_eq!(effective_address % 4, 0, "Unaligned load_word");
+        let memory_read = self.trace_load(effective_address);
+        match self.load_bytes(v_address, 4) {
+            Ok(data) => Ok((data as u32, memory_read)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Loads eight bytes. This method takes virtual address and translates
+    /// into physical address inside.
+    ///
+    /// # Arguments
+    /// * `v_address` Virtual address
+    pub fn load_doubleword(&mut self, v_address: u64) -> Result<(u64, RamRead), Trap> {
+        let effective_address = self.get_effective_address(v_address);
+        assert_eq!(effective_address % 8, 0, "Unaligned load_doubleword");
+        let memory_read = self.trace_load(effective_address);
+        match self.load_bytes(v_address, 8) {
+            Ok(data) => Ok((data, memory_read)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Store an byte. This method takes virtual address and translates
+    /// into physical address inside.
+    ///
+    /// # Arguments
+    /// * `v_address` Virtual address
+    /// * `value`
+    pub fn store(&mut self, v_address: u64, value: u8) -> Result<RamWrite, Trap> {
+        let effective_address = self.get_effective_address(v_address);
+        let memory_write = self.trace_store(effective_address, value as u64, 1);
+        match self.translate_address(v_address, &MemoryAccessType::Write) {
+            Ok(p_address) => {
+                self.store_raw(p_address, value);
+                Ok(memory_write)
+            }
+            Err(()) => Err(Trap {
+                trap_type: TrapType::StorePageFault,
+                value: v_address,
+            }),
+        }
+    }
+
+    /// Stores multiple bytes. This method takes virtual address and translates
+    /// into physical address inside.
+    ///
+    /// # Arguments
+    /// * `v_address` Virtual address
+    /// * `value` data written
+    /// * `width` Must be 1, 2, 4, or 8
+    fn store_bytes(&mut self, v_address: u64, value: u64, width: u64) -> Result<(), Trap> {
+        debug_assert!(
+            width == 1 || width == 2 || width == 4 || width == 8,
+            "Width must be 1, 2, 4, or 8. {width:X}"
+        );
+        match (v_address & 0xfff) <= (0x1000 - width) {
+            true => match self.translate_address(v_address, &MemoryAccessType::Write) {
+                Ok(p_address) => {
+                    // Fast path. All bytes fetched are in the same page so
+                    // translating an address only once.
+                    match width {
+                        1 => self.store_raw(p_address, value as u8),
+                        2 => self.store_halfword_raw(p_address, value as u16),
+                        4 => self.store_word_raw(p_address, value as u32),
+                        8 => self.store_doubleword_raw(p_address, value),
+                        _ => panic!("Width must be 1, 2, 4, or 8. {width:X}"),
+                    }
+                    Ok(())
+                }
+                Err(()) => Err(Trap {
+                    trap_type: TrapType::StorePageFault,
+                    value: v_address,
+                }),
+            },
+            false => {
+                for i in 0..width {
+                    match self.store(v_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8) {
+                        Ok(_) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Stores two bytes. This method takes virtual address and translates
+    /// into physical address inside.
+    ///
+    /// # Arguments
+    /// * `v_address` Virtual address
+    /// * `value` data written
+    pub fn store_halfword(&mut self, v_address: u64, value: u16) -> Result<RamWrite, Trap> {
+        let effective_address = self.get_effective_address(v_address);
+        assert_eq!(effective_address % 2, 0, "Unaligned store_halfword");
+        let memory_write = self.trace_store(effective_address, value as u64, 2);
+        self.store_bytes(v_address, value as u64, 2)?;
+        Ok(memory_write)
+    }
+
+    /// Stores four bytes. This method takes virtual address and translates
+    /// into physical address inside.
+    ///
+    /// # Arguments
+    /// * `v_address` Virtual address
+    /// * `value` data written
+    pub fn store_word(&mut self, v_address: u64, value: u32) -> Result<RamWrite, Trap> {
+        let effective_address = self.get_effective_address(v_address);
+        assert_eq!(effective_address % 4, 0, "Unaligned store_word");
+        let memory_write = self.trace_store(effective_address, value as u64, 4);
+        self.store_bytes(v_address, value as u64, 4)?;
+        Ok(memory_write)
+    }
+
+    /// Stores eight bytes. This method takes virtual address and translates
+    /// into physical address inside.
+    ///
+    /// # Arguments
+    /// * `v_address` Virtual address
+    /// * `value` data written
+    pub fn store_doubleword(&mut self, v_address: u64, value: u64) -> Result<RamWrite, Trap> {
+        let effective_address = self.get_effective_address(v_address);
+        assert_eq!(effective_address % 8, 0, "Unaligned store_doubleword");
+        let memory_write = self.trace_store(effective_address, value, 8);
+        self.store_bytes(v_address, value, 8)?;
+        Ok(memory_write)
+    }
+
+    /// Loads a byte from main memory or peripheral devices depending on
+    /// physical address.
+    ///
+    /// # Arguments
+    /// * `p_address` Physical address
+    pub fn load_raw(&mut self, p_address: u64) -> u8 {
+        let effective_address = self.get_effective_address(p_address);
+        self.assert_effective_load_address(effective_address);
+        match effective_address >= DRAM_BASE {
+            true => self.memory.read_byte(effective_address),
+            false => match effective_address {
+                0x00001020..=0x00001fff => panic!("load_raw:dtb is unsupported."),
+                0x02000000..=0x0200ffff => panic!("load_raw:clint is unsupported."),
+                0x0C000000..=0x0fffffff => panic!("load_raw:plic is unsupported."),
+                0x10000000..=0x100000ff => panic!("load_raw:UART is unsupported."),
+                0x10001000..=0x10001FFF => panic!("load_raw:disk is unsupported."),
+                _ => {
+                    if let Some(jolt_device) = self.jolt_device.as_ref() {
+                        if jolt_device.is_input(effective_address)
+                            || jolt_device.is_trusted_advice(effective_address)
+                            || jolt_device.is_untrusted_advice(effective_address)
+                            || jolt_device.is_output(effective_address)
+                            || jolt_device.is_panic(effective_address)
+                            || jolt_device.is_termination(effective_address)
+                            || effective_address <= RAM_START_ADDRESS - 8
+                        {
+                            return jolt_device.load(effective_address);
+                        }
+                    }
+                    panic!("Load Failed: Unknown memory mapping {effective_address:X}.");
+                }
+            },
+        }
+    }
+
+    /// Records a load at `effective_address` as a read of its containing
+    /// doubleword, the unit the RAM argument tracks.
+    fn trace_load(&mut self, effective_address: u64) -> RamRead {
+        let address = effective_address & !7;
+        RamRead {
+            address,
+            value: self.traced_doubleword(address),
+        }
+    }
+
+    /// Records a `width`-byte store of `value` at `effective_address` as a
+    /// write of its containing doubleword in which only the stored lane
+    /// changes. Callers enforce natural alignment, so the lane never crosses
+    /// into the next doubleword.
+    fn trace_store(&mut self, effective_address: u64, value: u64, width: u64) -> RamWrite {
+        self.assert_effective_store_address(effective_address);
+        let offset = effective_address & 7;
+        debug_assert!(offset + width <= 8, "store crosses a doubleword");
+        let address = effective_address & !7;
+        let pre_value = self.traced_doubleword(address);
+        let lane = (u64::MAX >> (64 - 8 * width)) << (8 * offset);
+        RamWrite {
+            address,
+            pre_value,
+            post_value: (pre_value & !lane) | ((value << (8 * offset)) & lane),
+        }
+    }
+
+    fn traced_doubleword(&mut self, address: u64) -> u64 {
+        if address < DRAM_BASE {
+            self.device_doubleword(address)
+        } else {
+            self.memory.read_doubleword(address)
+        }
+    }
+
+    /// Read a doubleword from the memory-mapped device region.
+    #[expect(clippy::expect_used)]
+    fn device_doubleword(&self, address: u64) -> u64 {
+        let jolt_device = self.jolt_device.as_ref().expect("JoltDevice not set");
+        let mut value_bytes = [0u8; 8];
+        for (i, byte) in value_bytes.iter_mut().enumerate() {
+            *byte = jolt_device.load(address + i as u64);
+        }
+        u64::from_le_bytes(value_bytes)
+    }
+
+    fn load_halfword_raw(&mut self, p_address: u64) -> u16 {
+        let effective_address = self.get_effective_address(p_address);
+        match effective_address >= DRAM_BASE
+            && effective_address.wrapping_add(1) > effective_address
+        {
+            true => {
+                self.assert_effective_load_address(effective_address);
+                self.memory.read_halfword(effective_address)
+            }
+            false => {
+                let mut data = 0_u16;
+                for i in 0..2 {
+                    data |= (self.load_raw(effective_address.wrapping_add(i)) as u16) << (i * 8)
+                }
+                data
+            }
+        }
+    }
+
+    /// Loads four bytes from main memory or peripheral devices depending on
+    /// physical address.
+    ///
+    /// # Arguments
+    /// * `p_address` Physical address
+    pub fn load_word_raw(&mut self, p_address: u64) -> u32 {
+        let effective_address = self.get_effective_address(p_address);
+        match effective_address >= DRAM_BASE
+            && effective_address.wrapping_add(3) > effective_address
+        {
+            true => {
+                self.assert_effective_load_address(effective_address);
+                self.memory.read_word(effective_address)
+            }
+            false => {
+                let mut data = 0_u32;
+                for i in 0..4 {
+                    data |= (self.load_raw(effective_address.wrapping_add(i)) as u32) << (i * 8)
+                }
+                data
+            }
+        }
+    }
+
+    /// Loads eight bytes from main memory or peripheral devices depending on
+    /// physical address.
+    ///
+    /// # Arguments
+    /// * `p_address` Physical address
+    pub fn load_doubleword_raw(&mut self, p_address: u64) -> u64 {
+        let effective_address = self.get_effective_address(p_address);
+        match effective_address >= DRAM_BASE
+            && effective_address.wrapping_add(7) > effective_address
+        {
+            true => {
+                self.assert_effective_load_address(effective_address);
+                self.memory.read_doubleword(effective_address)
+            }
+            false => {
+                let mut data = 0_u64;
+                for i in 0..8 {
+                    data |= (self.load_raw(effective_address.wrapping_add(i)) as u64) << (i * 8)
+                }
+                data
+            }
+        }
+    }
+
+    /// Stores a byte to main memory or peripheral devices depending on
+    /// physical address.
+    ///
+    /// # Arguments
+    /// * `p_address` Physical address
+    /// * `value` data written
+    pub fn store_raw(&mut self, p_address: u64, value: u8) {
+        let effective_address = self.get_effective_address(p_address);
+        self.decode_cache.invalidate_store(effective_address, 1);
+        match effective_address >= DRAM_BASE {
+            true => {
+                self.assert_effective_store_address(effective_address);
+                self.memory.write_byte(effective_address, value)
+            }
+            false => match effective_address {
+                0x02000000..=0x0200ffff => panic!("store_raw:clint is unsupported."),
+                0x0c000000..=0x0fffffff => panic!("store_raw:plic is unsupported."),
+                0x10000000..=0x100000ff => panic!("store_raw:UART is unsupported."),
+                0x10001000..=0x10001FFF => panic!("store_raw:disk is unsupported."),
+                _ => {
+                    self.assert_effective_store_address(effective_address);
+                    if let Some(jolt_device) = self.jolt_device.as_mut() {
+                        return jolt_device.store(effective_address, value);
+                    };
+
+                    panic!("Store Failed: Unknown memory mapping {effective_address:X}.");
+                }
+            },
+        };
+    }
+
+    pub fn setup_bytecode(&mut self, p_address: u64, value: u8) {
+        let effective_address = self.get_effective_address(p_address);
+
+        assert!(
+            effective_address >= DRAM_BASE,
+            "setup_bytecode: Effective address must be >= DRAM_BASE, got {effective_address:X}."
+        );
+
+        if let Some(jolt_device) = self.jolt_device.as_ref() {
+            assert!(
+                effective_address <= jolt_device.memory_layout.stack_end,
+                "setup_bytecode: Effective address must be < stack_end, got {effective_address:X}."
+            );
+        }
+
+        self.memory.write_byte(effective_address, value)
+    }
+
+    fn store_halfword_raw(&mut self, p_address: u64, value: u16) {
+        let effective_address = self.get_effective_address(p_address);
+        self.decode_cache.invalidate_store(effective_address, 2);
+        match effective_address >= DRAM_BASE
+            && effective_address.wrapping_add(1) > effective_address
+        {
+            true => {
+                self.assert_effective_store_address(effective_address);
+                self.memory.write_halfword(effective_address, value)
+            }
+            false => {
+                for i in 0..2 {
+                    self.store_raw(
+                        effective_address.wrapping_add(i),
+                        ((value >> (i * 8)) & 0xff) as u8,
+                    );
+                }
+            }
+        }
+    }
+
+    fn store_word_raw(&mut self, p_address: u64, value: u32) {
+        let effective_address = self.get_effective_address(p_address);
+        self.decode_cache.invalidate_store(effective_address, 4);
+        match effective_address >= DRAM_BASE
+            && effective_address.wrapping_add(3) > effective_address
+        {
+            true => {
+                self.assert_effective_store_address(effective_address);
+                self.memory.write_word(effective_address, value)
+            }
+            false => {
+                for i in 0..4 {
+                    self.store_raw(
+                        effective_address.wrapping_add(i),
+                        ((value >> (i * 8)) & 0xff) as u8,
+                    );
+                }
+            }
+        }
+    }
+
+    fn store_doubleword_raw(&mut self, p_address: u64, value: u64) {
+        let effective_address = self.get_effective_address(p_address);
+        self.decode_cache.invalidate_store(effective_address, 8);
+        match effective_address >= DRAM_BASE
+            && effective_address.wrapping_add(7) > effective_address
+        {
+            true => {
+                self.assert_effective_store_address(effective_address);
+                self.memory.write_doubleword(effective_address, value)
+            }
+            false => {
+                for i in 0..8 {
+                    self.store_raw(
+                        effective_address.wrapping_add(i),
+                        ((value >> (i * 8)) & 0xff) as u8,
+                    );
+                }
+            }
+        }
+    }
+
+    fn translate_address(
+        &mut self,
+        v_address: u64,
+        access_type: &MemoryAccessType,
+    ) -> Result<u64, ()> {
+        let address = self.get_effective_address(v_address);
+        let p_address = match self.addressing_mode {
+            AddressingMode::None => Ok(address),
+            AddressingMode::SV39 => match self.privilege_mode {
+                PrivilegeMode::Machine => match access_type {
+                    MemoryAccessType::Execute => Ok(address),
+                    _ => match (self.mstatus >> 17) & 1 {
+                        0 => Ok(address),
+                        _ => {
+                            let privilege_mode = get_privilege_mode((self.mstatus >> 11) & 3);
+                            match privilege_mode {
+                                PrivilegeMode::Machine => Ok(address),
+                                _ => {
+                                    let current_privilege_mode = self.privilege_mode;
+                                    self.update_privilege_mode(privilege_mode);
+                                    let result = self.translate_address(v_address, access_type);
+                                    self.update_privilege_mode(current_privilege_mode);
+                                    result
+                                }
+                            }
+                        }
+                    },
+                },
+                PrivilegeMode::User | PrivilegeMode::Supervisor => {
+                    let vpns = [
+                        (address >> 12) & 0x1ff,
+                        (address >> 21) & 0x1ff,
+                        (address >> 30) & 0x1ff,
+                    ];
+                    self.traverse_page(address, 3 - 1, self.ppn, &vpns, access_type)
+                }
+                _ => Ok(address),
+            },
+            AddressingMode::SV48 => {
+                panic!("AddressingMode SV48 is not supported yet.");
+            }
+        };
+        p_address
+    }
+
+    fn traverse_page(
+        &mut self,
+        v_address: u64,
+        level: u8,
+        parent_ppn: u64,
+        vpns: &[u64],
+        access_type: &MemoryAccessType,
+    ) -> Result<u64, ()> {
+        let pagesize = 4096;
+        let ptesize = 8;
+        let pte_address = parent_ppn * pagesize + vpns[level as usize] * ptesize;
+        let pte = self.load_doubleword_raw(pte_address);
+        let ppn = (pte >> 10) & 0xfffffffffff;
+        let ppns = match self.addressing_mode {
+            AddressingMode::SV39 => [
+                (pte >> 10) & 0x1ff,
+                (pte >> 19) & 0x1ff,
+                (pte >> 28) & 0x3ffffff,
+            ],
+            _ => panic!(),
+        };
+        let _rsw = (pte >> 8) & 0x3;
+        let d = (pte >> 7) & 1;
+        let a = (pte >> 6) & 1;
+        let _g = (pte >> 5) & 1;
+        let _u = (pte >> 4) & 1;
+        let x = (pte >> 3) & 1;
+        let w = (pte >> 2) & 1;
+        let r = (pte >> 1) & 1;
+        let v = pte & 1;
+
+        if v == 0 || (r == 0 && w == 1) {
+            return Err(());
+        }
+
+        if r == 0 && x == 0 {
+            return match level {
+                0 => Err(()),
+                _ => self.traverse_page(v_address, level - 1, ppn, vpns, access_type),
+            };
+        }
+
+        if a == 0
+            || (match access_type {
+                MemoryAccessType::Write => d == 0,
+                _ => false,
+            })
+        {
+            let new_pte = pte
+                | (1 << 6)
+                | (match access_type {
+                    MemoryAccessType::Write => 1 << 7,
+                    _ => 0,
+                });
+            self.store_doubleword_raw(pte_address, new_pte);
+        }
+
+        match access_type {
+            MemoryAccessType::Execute => {
+                if x == 0 {
+                    return Err(());
+                }
+            }
+            MemoryAccessType::Read => {
+                if r == 0 {
+                    return Err(());
+                }
+            }
+            MemoryAccessType::Write => {
+                if w == 0 {
+                    return Err(());
+                }
+            }
+        };
+
+        let offset = v_address & 0xfff;
+        let p_address = match level {
+            2 => {
+                if ppns[1] != 0 || ppns[0] != 0 {
+                    return Err(());
+                }
+                (ppns[2] << 30) | (vpns[1] << 21) | (vpns[0] << 12) | offset
+            }
+            1 => {
+                if ppns[0] != 0 {
+                    return Err(());
+                }
+                (ppns[2] << 30) | (ppns[1] << 21) | (vpns[0] << 12) | offset
+            }
+            0 => (ppn << 12) | offset,
+            _ => panic!(),
+        };
+
+        Ok(p_address)
+    }
+}
+
+impl Mmu {
+    pub fn save_state_with_empty_memory(&self) -> Mmu {
+        Mmu {
+            ppn: self.ppn,
+            addressing_mode: self.addressing_mode,
+            privilege_mode: self.privilege_mode,
+            memory: MemoryWrapper {
+                memory: Memory::empty(),
+            },
+            decode_cache: self.decode_cache.snapshot_with_empty_entries(),
+            jolt_device: self.jolt_device.clone(),
+            mstatus: self.mstatus,
+        }
+    }
+
+    /// Capture chunk-replay MMU translation state. Static for Jolt guests
+    /// (no virtual addressing) but tiny; the destructure is exhaustive so
+    /// new fields must be classified.
+    pub(crate) fn capture_chunk_state(&self) -> ChunkMmuState {
+        let Mmu {
+            ppn,
+            addressing_mode,
+            privilege_mode,
+            // Snapshotted separately (pooled image / checkpoint layer).
+            memory: _,
+            decode_cache: _,
+            jolt_device: _,
+            mstatus,
+        } = self;
+        ChunkMmuState {
+            ppn: *ppn,
+            addressing_mode: *addressing_mode,
+            privilege_mode: *privilege_mode,
+            mstatus: *mstatus,
+        }
+    }
+
+    /// Counterpart of [`Mmu::capture_chunk_state`].
+    pub(crate) fn install_chunk_state(&mut self, state: &ChunkMmuState) {
+        self.ppn = state.ppn;
+        self.addressing_mode = state.addressing_mode;
+        self.privilege_mode = state.privilege_mode;
+        self.mstatus = state.mstatus;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChunkMmuState {
+    ppn: u64,
+    addressing_mode: AddressingMode,
+    privilege_mode: PrivilegeMode,
+    mstatus: u64,
+}
+
+/// [`Memory`](../memory/struct.Memory.html) wrapper. Converts physical address to the one in memory
+/// using [`DRAM_BASE`](constant.DRAM_BASE.html) and accesses [`Memory`](../memory/struct.Memory.html).
+#[derive(Clone, Debug)]
+pub struct MemoryWrapper {
+    pub memory: Memory,
+}
+
+impl MemoryWrapper {
+    fn new() -> Self {
+        MemoryWrapper {
+            memory: Memory::empty(),
+        }
+    }
+
+    fn init(&mut self, capacity: u64) {
+        self.memory.init(capacity);
+    }
+
+    pub fn read_byte(&mut self, p_address: u64) -> u8 {
+        debug_assert!(
+            p_address >= DRAM_BASE,
+            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
+        );
+
+        self.memory.read_byte(p_address - DRAM_BASE)
+    }
+
+    pub fn read_halfword(&mut self, p_address: u64) -> u16 {
+        debug_assert!(
+            p_address >= DRAM_BASE && p_address.wrapping_add(1) >= DRAM_BASE,
+            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
+        );
+
+        self.memory.read_halfword(p_address - DRAM_BASE)
+    }
+
+    pub fn read_word(&mut self, p_address: u64) -> u32 {
+        debug_assert!(
+            p_address >= DRAM_BASE && p_address.wrapping_add(3) >= DRAM_BASE,
+            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
+        );
+
+        self.memory.read_word(p_address - DRAM_BASE)
+    }
+
+    pub fn read_doubleword(&mut self, p_address: u64) -> u64 {
+        debug_assert!(
+            p_address >= DRAM_BASE && p_address.wrapping_add(7) >= DRAM_BASE,
+            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
+        );
+
+        self.memory.read_doubleword(p_address - DRAM_BASE)
+    }
+
+    pub fn write_byte(&mut self, p_address: u64, value: u8) {
+        debug_assert!(
+            p_address >= DRAM_BASE,
+            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
+        );
+
+        self.memory.write_byte(p_address - DRAM_BASE, value);
+    }
+
+    pub fn write_halfword(&mut self, p_address: u64, value: u16) {
+        debug_assert!(
+            p_address >= DRAM_BASE && p_address.wrapping_add(1) >= DRAM_BASE,
+            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
+        );
+
+        self.memory.write_halfword(p_address - DRAM_BASE, value);
+    }
+
+    pub fn write_word(&mut self, p_address: u64, value: u32) {
+        debug_assert!(
+            p_address >= DRAM_BASE && p_address.wrapping_add(3) >= DRAM_BASE,
+            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
+        );
+
+        self.memory.write_word(p_address - DRAM_BASE, value);
+    }
+
+    pub fn write_doubleword(&mut self, p_address: u64, value: u64) {
+        debug_assert!(
+            p_address >= DRAM_BASE && p_address.wrapping_add(7) >= DRAM_BASE,
+            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
+        );
+
+        self.memory.write_doubleword(p_address - DRAM_BASE, value);
+    }
+
+    pub fn validate_address(&self, address: u64) -> bool {
+        self.memory.validate_address(address - DRAM_BASE)
+    }
+}
+
+#[cfg(test)]
+mod test_mmu {
+    use super::*;
+    use crate::emulator::terminal::DummyTerminal;
+    use common::jolt_device::MemoryConfig;
+
+    fn setup_mmu() -> Mmu {
+        let terminal = Box::new(DummyTerminal::default());
+        let mut mmu = Mmu::new(terminal);
+        let memory_config = MemoryConfig {
+            program_size: Some(1024),
+            ..Default::default()
+        };
+        mmu.jolt_device = Some(JoltDevice::new(&memory_config));
+        let capacity = mmu
+            .jolt_device
+            .as_ref()
+            .unwrap()
+            .memory_layout
+            .get_total_memory_size();
+        mmu.init_memory(capacity);
+
+        mmu
+    }
+
+    #[test]
+    #[should_panic(expected = "Heap overflow")]
+    fn test_heap_overflow() {
+        let mut mmu = setup_mmu();
+
+        let overflow_address = mmu.jolt_device.as_ref().unwrap().memory_layout.heap_end + 1;
+        mmu.trace_store(overflow_address, 0x13, 1);
+    }
+
+    /// The canary occupies `[stack_end, stack_end + STACK_CANARY_SIZE)` (the
+    /// linker script places it immediately after the program image), so the
+    /// first canary byte must be rejected.
+    #[test]
+    #[should_panic(expected = "Stack overflow")]
+    fn test_stack_overflow_first_canary_byte() {
+        let mut mmu = setup_mmu();
+
+        let stack_end = mmu.jolt_device.as_ref().unwrap().memory_layout.stack_end;
+        mmu.trace_store(stack_end, 0x13, 1);
+    }
+
+    #[test]
+    fn test_lowest_stack_word_is_writable() {
+        let mut mmu = setup_mmu();
+
+        let stack_end = mmu.jolt_device.as_ref().unwrap().memory_layout.stack_end;
+        mmu.store_doubleword(stack_end + STACK_CANARY_SIZE, 0x1234)
+            .unwrap();
+        assert_eq!(
+            mmu.load_doubleword(stack_end + STACK_CANARY_SIZE)
+                .unwrap()
+                .0,
+            0x1234
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Unknown memory mapping")]
+    fn test_io_underflow() {
+        let mut mmu = setup_mmu();
+        let trusted_advice_size = mmu
+            .jolt_device
+            .as_ref()
+            .unwrap()
+            .memory_layout
+            .max_trusted_advice_size;
+        let untrusted_advice_size = mmu
+            .jolt_device
+            .as_ref()
+            .unwrap()
+            .memory_layout
+            .max_untrusted_advice_size;
+        let invalid_addr = mmu.jolt_device.as_ref().unwrap().memory_layout.input_start
+            - 1
+            - trusted_advice_size
+            - untrusted_advice_size;
+        // Write to address below I/O region - rejected as unknown mapping
+        // (Note: address is in "zero-padding" range so passes underflow check,
+        // but fails device I/O check since it's not a valid write target)
+        mmu.store_bytes(invalid_addr, 0xc50513, 2).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "I/O overflow")]
+    fn test_io_overflow() {
+        let mut mmu = setup_mmu();
+        let invalid_addr = mmu.jolt_device.as_ref().unwrap().memory_layout.io_end + 1;
+        mmu.store_bytes(invalid_addr, 0xc50513, 2).unwrap();
+    }
+
+    #[test]
+    fn test_mprv_uses_mpp_machine_fast_path() {
+        let mut mmu = setup_mmu();
+
+        mmu.update_addressing_mode(AddressingMode::SV39);
+        mmu.update_privilege_mode(PrivilegeMode::Machine);
+
+        let mprv_bit: u64 = 1 << 17;
+        let mpp_machine: u64 = (get_privilege_mode(3) as u64) << 11;
+        mmu.update_mstatus(mprv_bit | mpp_machine);
+
+        let v_address = DRAM_BASE;
+        let result = mmu.translate_address(v_address, &MemoryAccessType::Read);
+
+        assert_eq!(result, Ok(v_address));
+    }
+
+    #[test]
+    fn loads_and_stores_round_trip_through_ram_and_report_word_state() {
+        let mut mmu = setup_mmu();
+        let addr = DRAM_BASE + 0x100;
+
+        let write = mmu.store_word(addr, 0xdead_beef).unwrap();
+        assert_eq!(write.address, addr);
+        assert_eq!(write.pre_value, 0);
+        assert_eq!(write.post_value, 0xdead_beef);
+
+        let (value, read) = mmu.load_word(addr).unwrap();
+        assert_eq!(value, 0xdead_beef);
+        assert_eq!(read.address, addr);
+        assert_eq!(read.value, 0xdead_beef);
+
+        let write = mmu
+            .store_doubleword(addr + 8, 0x0102_0304_0506_0708)
+            .unwrap();
+        assert_eq!(write.post_value, 0x0102_0304_0506_0708);
+        assert_eq!(
+            mmu.load_doubleword(addr + 8).unwrap().0,
+            0x0102_0304_0506_0708
+        );
+
+        let write = mmu.store_halfword(addr + 16, 0xbeef).unwrap();
+        assert_eq!(write.post_value, 0xbeef);
+        assert_eq!(mmu.load_halfword(addr + 16).unwrap().0, 0xbeef);
+
+        let _ = mmu.store(addr + 24, 0xab).unwrap();
+        assert_eq!(mmu.load(addr + 24).unwrap().0, 0xab);
+    }
+
+    /// Every sub-doubleword access is recorded against its containing
+    /// doubleword: loads read the whole doubleword, and a store's record
+    /// changes only its lane, as a byte-array model of the store predicts.
+    #[test]
+    fn sub_doubleword_accesses_trace_the_containing_doubleword() {
+        const OLD: u64 = 0x8877_6655_4433_2211;
+        const VALUE: u64 = 0xF1E2_D3C4_B5A6_9788;
+        let doubleword = DRAM_BASE + 0x40;
+        for width in [1u64, 2, 4] {
+            for offset in (0..8).step_by(width as usize) {
+                let mut mmu = setup_mmu();
+                mmu.store_doubleword(doubleword, OLD).unwrap();
+                let address = doubleword + offset;
+
+                let read = match width {
+                    1 => mmu.load(address).unwrap().1,
+                    2 => mmu.load_halfword(address).unwrap().1,
+                    _ => mmu.load_word(address).unwrap().1,
+                };
+                assert_eq!((read.address, read.value), (doubleword, OLD));
+
+                let write = match width {
+                    1 => mmu.store(address, VALUE as u8),
+                    2 => mmu.store_halfword(address, VALUE as u16),
+                    _ => mmu.store_word(address, VALUE as u32),
+                }
+                .unwrap();
+                let mut expected = OLD.to_le_bytes();
+                let lane = offset as usize..(offset + width) as usize;
+                expected[lane.clone()].copy_from_slice(&VALUE.to_le_bytes()[..lane.len()]);
+                let expected = u64::from_le_bytes(expected);
+                assert_eq!(
+                    (write.address, write.pre_value, write.post_value),
+                    (doubleword, OLD, expected),
+                    "width {width}, offset {offset}"
+                );
+                assert_eq!(mmu.load_doubleword(doubleword).unwrap().0, expected);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Unaligned load_word")]
+    fn load_word_rejects_misaligned_addresses() {
+        let mut mmu = setup_mmu();
+        let _ = mmu.load_word(DRAM_BASE + 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unaligned load_halfword")]
+    fn load_halfword_rejects_misaligned_addresses() {
+        let mut mmu = setup_mmu();
+        let _ = mmu.load_halfword(DRAM_BASE + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unaligned load_doubleword")]
+    fn load_doubleword_rejects_misaligned_addresses() {
+        let mut mmu = setup_mmu();
+        let _ = mmu.load_doubleword(DRAM_BASE + 4);
+    }
+
+    #[test]
+    fn fetch_word_crosses_page_boundaries_byte_by_byte() {
+        let mut mmu = setup_mmu();
+        let addr = DRAM_BASE + 0xffe;
+        mmu.store_raw(addr, 0x13);
+        mmu.store_raw(addr + 1, 0x05);
+        mmu.store_raw(addr + 2, 0xc5);
+        mmu.store_raw(addr + 3, 0x00);
+        assert_eq!(mmu.fetch_word(addr).unwrap(), 0x00c5_0513);
+        mmu.store_word(DRAM_BASE + 0x10, 0x00c5_0513).unwrap();
+        assert_eq!(mmu.fetch_word(DRAM_BASE + 0x10).unwrap(), 0x00c5_0513);
+    }
+
+    #[test]
+    fn page_crossing_load_and_store_bytes_agree_with_the_fast_path() {
+        let mut mmu = setup_mmu();
+        let boundary = DRAM_BASE + 0x1000;
+        mmu.store_bytes(boundary - 4, 0x1122_3344_5566_7788, 8)
+            .unwrap();
+        assert_eq!(
+            mmu.load_bytes(boundary - 4, 8).unwrap(),
+            0x1122_3344_5566_7788
+        );
+        assert_eq!(mmu.load_bytes(boundary - 4, 4).unwrap(), 0x5566_7788);
+        assert_eq!(mmu.load_bytes(boundary, 4).unwrap(), 0x1122_3344);
+    }
+
+    #[test]
+    fn device_region_loads_read_the_jolt_device() {
+        let mut mmu = setup_mmu();
+        mmu.jolt_device.as_mut().unwrap().inputs =
+            vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let input_start = mmu.jolt_device.as_ref().unwrap().memory_layout.input_start;
+
+        assert_eq!(mmu.load_raw(input_start), 0x11);
+        assert_eq!(mmu.load_halfword_raw(input_start), 0x2211);
+        assert_eq!(mmu.load_word_raw(input_start), 0x4433_2211);
+        assert_eq!(mmu.load_doubleword_raw(input_start), 0x8877_6655_4433_2211);
+
+        let (byte, read) = mmu.load(input_start).unwrap();
+        assert_eq!(byte, 0x11);
+        assert_eq!(read.address, input_start & !7);
+        assert_eq!(read.value & 0xff, 0x11);
+    }
+
+    #[test]
+    fn device_region_stores_write_the_output_buffer() {
+        let mut mmu = setup_mmu();
+        let output_start = mmu.jolt_device.as_ref().unwrap().memory_layout.output_start;
+
+        mmu.store_raw(output_start, 0xAA);
+        assert_eq!(mmu.jolt_device.as_ref().unwrap().outputs[0], 0xAA);
+
+        mmu.store_halfword_raw(output_start + 2, 0xBBCC);
+        assert_eq!(mmu.jolt_device.as_ref().unwrap().outputs[2], 0xCC);
+        assert_eq!(mmu.jolt_device.as_ref().unwrap().outputs[3], 0xBB);
+
+        mmu.store_word_raw(output_start + 4, 0x0102_0304);
+        assert_eq!(
+            mmu.jolt_device.as_ref().unwrap().outputs[4..8],
+            [4, 3, 2, 1]
+        );
+
+        mmu.store_doubleword_raw(output_start + 8, 0x1112_1314_1516_1718);
+        assert_eq!(
+            mmu.jolt_device.as_ref().unwrap().outputs[8..16],
+            [0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11]
+        );
+
+        let write = mmu.store(output_start + 16, 0x5A).unwrap();
+        assert_eq!(write.address, (output_start + 16) & !7);
+        assert_eq!(mmu.jolt_device.as_ref().unwrap().outputs[16], 0x5A);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be >= DRAM_BASE")]
+    fn setup_bytecode_rejects_device_addresses() {
+        let mut mmu = setup_mmu();
+        mmu.setup_bytecode(DRAM_BASE - 1, 0x77);
+    }
+}

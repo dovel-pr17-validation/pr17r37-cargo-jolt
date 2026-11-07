@@ -1,0 +1,70 @@
+use crate::instruction::registers::r::RegisterStateR;
+use serde::{Deserialize, Serialize};
+
+use crate::{declare_riscv_instr, emulator::cpu::Cpu};
+
+use super::{format::format_r::FormatR, Cycle, Instruction, RISCVInstruction, RISCVTrace};
+
+declare_riscv_instr!(
+    name   = MULHSU,
+    mask   = 0xfe00707f,
+    match  = 0x02002033,
+    format = FormatR,
+    registers = RegisterStateR,
+    ram    = ()
+);
+
+impl MULHSU {
+    fn exec(&self, cpu: &mut Cpu, _: &mut <MULHSU as RISCVInstruction>::RamAccess) {
+        cpu.write_register(
+            self.operands.rd as usize,
+            ((cpu.x[self.operands.rs1 as usize] as i128 as u128)
+                .wrapping_mul(cpu.x[self.operands.rs2 as usize] as u64 as u128)
+                >> 64) as i64,
+        );
+    }
+}
+
+impl MULHSU {
+    #[cfg(test)]
+    fn with_regs(rd: u8, rs1: u8, rs2: u8) -> Self {
+        let word = Self::MATCH | ((rd as u32) << 7) | ((rs1 as u32) << 15) | ((rs2 as u32) << 20);
+        Self::new(word, 0x1000, true, false)
+    }
+}
+
+impl RISCVTrace for MULHSU {
+    fn trace(&self, cpu: &mut Cpu, trace: Option<&mut Vec<Cycle>>) {
+        super::trace_inline_sequence(&Instruction::from(*self), cpu, trace);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emulator::{cpu::Cpu, default_terminal::DefaultTerminal};
+
+    #[test]
+    fn test_mulhsu_negative_rs1() {
+        let mut cpu = Cpu::new(Box::new(DefaultTerminal::default()));
+
+        let instr = MULHSU::with_regs(1, 2, 3);
+
+        cpu.x[2] = -1_i64;
+        cpu.x[3] = 2;
+
+        instr.exec(&mut cpu, &mut ());
+
+        // (-1_i128) * (2_u128 treated as 128-bit) = -2_i128
+        // -2 in two's complement 128-bit = 0xFFFF...FFFE
+        // upper 64 bits = 0xFFFFFFFFFFFFFFFF
+        //
+        // Before the fix, the incorrect zero-extension computed:
+        //   0xFFFFFFFFFFFFFFFF_u128 * 2_u128 = 0x1_FFFFFFFFFFFFFFFE
+        //   upper 64 = 1 (WRONG)
+        assert_eq!(
+            cpu.x[1] as u64, 0xFFFFFFFFFFFFFFFF,
+            "MULHSU(-1, 2) upper 64 bits should be all-ones"
+        );
+    }
+}

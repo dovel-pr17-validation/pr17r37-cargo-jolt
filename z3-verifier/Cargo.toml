@@ -1,0 +1,29 @@
+[package]
+name = "z3-verifier"
+edition = "2021"
+
+[dependencies]
+paste.workspace = true
+
+jolt-claims.workspace = true
+jolt-field = { workspace = true }
+jolt-r1cs = { workspace = true }
+jolt-riscv = { workspace = true }
+common = { path = "../common" }
+tracer = { path = "../tracer" }
+z3 = "0.21.0"
+# This pin selects Z3 5.1.0 for vendored-z3 within z3-sys's ^501 requirement.
+# z3-src has no `links` key: a pin outside that major resolves a second crate,
+# unused by z3-sys, instead of failing. Update the pin together with z3/z3-sys;
+# Dependabot ignores z3-src and z3 minor/major updates, but permits z3 patches.
+# Cargo.lock plus --locked in .github/workflows/z3-nightly.yml prevent drift.
+z3-src = { version = "=501.0.1", optional = true }
+
+[features]
+# Build Z3 from pinned vendored source instead of linking the runner's libz3.
+# Used by .github/workflows/z3-nightly.yml so nightly results depend only on
+# this repo, not on runner packages.
+vendored-z3 = ["z3/vendored", "dep:z3-src"]
+
+[package.metadata.cargo-machete]
+ignored = ["z3-src"]
