@@ -24,7 +24,7 @@ spongefish.workspace = true
 strum.workspace = true
 build-fs-tree = "0.8.1"
 allocative.workspace = true
-num-bigint = "0.4"
+num-bigint = "0.5"
 
 jolt-field = { workspace = true, features = ["spongefish"] }
 jolt-claims.workspace = true
