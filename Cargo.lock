@@ -292,7 +292,7 @@ dependencies = [
  "jolt-field",
  "jolt-transcript",
  "sha3 0.12.0",
- "spongefish",
+ "spongefish 0.8.0",
 ]
 
 [[package]]
@@ -3420,7 +3420,7 @@ dependencies = [
  "rand_core 0.6.4",
  "rayon",
  "serde",
- "spongefish",
+ "spongefish 0.9.0",
  "thiserror 2.0.21",
 ]
 
@@ -3548,7 +3548,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "spongefish",
+ "spongefish 0.9.0",
  "tempfile",
  "tracer",
  "tracing",
@@ -3827,7 +3827,7 @@ dependencies = [
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "serde",
- "spongefish",
+ "spongefish 0.9.0",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -4095,7 +4095,7 @@ dependencies = [
  "num-bigint",
  "sha3 0.12.0",
  "shake",
- "spongefish",
+ "spongefish 0.9.0",
 ]
 
 [[package]]
@@ -6616,6 +6616,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62560b5029264a655fc461a0ecadc4d24862799190897d3225b3272b7a3f13b7"
 dependencies = [
  "digest 0.11.3",
+ "zeroize",
+]
+
+[[package]]
+name = "spongefish"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06eeb04b73f24a722226c9375e111cc3f3a4ea4ee7383c5b0e05ace654672d4f"
+dependencies = [
  "getrandom 0.4.3",
  "keccak",
  "zeroize",
@@ -8061,7 +8070,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "spongefish",
+ "spongefish 0.9.0",
  "strum 0.28.0",
  "tracer",
 ]
